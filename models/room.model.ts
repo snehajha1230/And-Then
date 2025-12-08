@@ -23,7 +23,12 @@ const RoomSchema = new Schema(
       default: new Map(),
     },
     currentChoiceIndex: { type: Number, default: 0 },
-    createdAt: { type: Date, default: Date.now, expires: 86400 }, 
+    isProcessing: { type: Boolean, default: false }, // Track if choice is being processed
+    lastChoiceEvaluation: {
+      quality: { type: String, enum: ["excellent", "good", "average", "bad"], default: null },
+      message: { type: String, default: null },
+    },
+    createdAt: { type: Date, default: Date.now, expires: 86400 }, // Auto-delete after 24 hours
   },
   { timestamps: true },
 )

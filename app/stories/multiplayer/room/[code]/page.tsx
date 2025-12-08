@@ -85,6 +85,31 @@ export default function RoomLobbyPage() {
   useEffect(() => {
     if (!roomCode) return
 
+    // Automatically join the room when navigating to it
+    const joinRoom = async () => {
+      try {
+        const res = await fetch("/api/multiplayer/rooms/join", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ roomCode }),
+        })
+
+        if (!res.ok) {
+          const error = await res.json()
+          // If room is completed or not found, show error
+          if (res.status === 404 || res.status === 400) {
+            toast.error(error.error || "Cannot join room")
+            router.push("/stories/multiplayer")
+            return
+          }
+        }
+      } catch (error) {
+        console.error("Error joining room:", error)
+        // Continue anyway - user might already be in the room
+      }
+    }
+
+    void joinRoom()
     void fetchRoom()
 
     // Poll for room updates every 2 seconds

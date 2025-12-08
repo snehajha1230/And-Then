@@ -33,11 +33,13 @@ export async function POST(request: NextRequest) {
       (p: any) => p.toString() === userId || (p._id && p._id.toString() === userId),
     )
 
+    // Allow re-joining even if they were previously in the room (they may have left)
     if (!isParticipant) {
       // Add user to participants
       room.participants.push(userId)
       await room.save()
     }
+    // If user is already a participant, just return success (allows re-joining)
 
     return NextResponse.json({
       message: "Joined room",

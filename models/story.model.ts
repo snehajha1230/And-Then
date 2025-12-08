@@ -32,6 +32,7 @@ const StorySchema = new Schema(
       },
     ],
     isMultiplayer: { type: Boolean, default: false },
+    roomCode: { type: String, default: null }, // Room code for multiplayer stories
     savedAt: { type: Date, default: Date.now },
   },
   { timestamps: true },

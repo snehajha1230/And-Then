@@ -53,6 +53,8 @@ export async function GET(
         storyId: room.storyId ? room.storyId.toString() : null,
         choiceVotes: choiceVotesObj,
         currentChoiceIndex: room.currentChoiceIndex,
+        isProcessing: room.isProcessing || false,
+        lastChoiceEvaluation: room.lastChoiceEvaluation || null,
       },
     })
   } catch (error) {

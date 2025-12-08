@@ -11,7 +11,7 @@ import { AnimatedGrid } from "@/components/ui/animated-grid"
 import { Progress } from "@/components/ui/progress"
 import { type Story, STORY_GENRES, type PersonalityResult } from "@/lib/story-data"
 import { getDefaultUserStats, fetchUserStats, type UserStats } from "@/lib/gamification"
-import { BookOpen, Plus, Trash2, Play, BarChart3, LogOut, Award, Zap, Trophy, Users } from "lucide-react"
+import { BookOpen, Plus, Trash2, Play, BarChart3, LogOut, Award, Zap, Trophy, Users, DoorOpen } from "lucide-react"
 import { toast } from "sonner"
 
 interface CurrentUser {
@@ -319,15 +319,32 @@ export default function DashboardPage() {
 
                     <div className="flex items-center justify-between text-xs text-foreground/50 mb-6 font-display uppercase">
                       <span>Chapter {story.currentChoiceIndex + 1}</span>
-                      <span>{new Date(story.createdAt).toLocaleDateString()}</span>
+                      <span>{new Date((story as any).createdAt || story.createdAt).toLocaleDateString()}</span>
                     </div>
 
-                    <Link href={`/stories/play/${(story as any)._id || story.id}`} onClick={() => handlePlayStory(story)}>
-                      <NeonButton glowColor="cyan" className="w-full text-sm">
-                        <Play className="w-4 h-4 mr-2" />
-                        Continue
-                      </NeonButton>
-                    </Link>
+                    {/* Show multiplayer badge if it's a multiplayer story */}
+                    {(story as any).isMultiplayer && (story as any).roomCode && (
+                      <div className="mb-3 px-2 py-1 bg-primary/10 border border-primary/30 rounded text-xs font-display uppercase tracking-wider text-primary">
+                        Multiplayer • Room: {(story as any).roomCode}
+                      </div>
+                    )}
+
+                    {/* Show Join Room button for multiplayer stories, Continue for single player */}
+                    {(story as any).isMultiplayer && (story as any).roomCode ? (
+                      <Link href={`/stories/multiplayer/room/${(story as any).roomCode}`}>
+                        <NeonButton glowColor="cyan" className="w-full text-sm">
+                          <DoorOpen className="w-4 h-4 mr-2" />
+                          Join Room
+                        </NeonButton>
+                      </Link>
+                    ) : (
+                      <Link href={`/stories/play/${(story as any)._id || story.id}`} onClick={() => handlePlayStory(story)}>
+                        <NeonButton glowColor="cyan" className="w-full text-sm">
+                          <Play className="w-4 h-4 mr-2" />
+                          Continue
+                        </NeonButton>
+                      </Link>
+                    )}
                   </NeonCard>
                 )
               })}

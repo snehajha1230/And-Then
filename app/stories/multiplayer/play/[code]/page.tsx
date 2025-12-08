@@ -7,7 +7,7 @@ import { BookLayout } from "@/components/book-layout"
 import { BOOK_THEMES, DEFAULT_THEME } from "@/lib/book-themes"
 import { type Story, STORY_GENRES } from "@/lib/story-data"
 import { NeonButton } from "@/components/ui/neon-button"
-import { ChevronLeft, Loader2, Volume2, Users, Play, Save } from "lucide-react"
+import { ChevronLeft, Loader2, Volume2, Users, Play, Save, LogOut } from "lucide-react"
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 import Link from "next/link"
@@ -29,6 +29,11 @@ interface RoomData {
   choiceVotes: Record<string, string[]>
   currentChoiceIndex: number
   storyId: string | null
+  isProcessing?: boolean
+  lastChoiceEvaluation?: {
+    quality: "excellent" | "good" | "average" | "bad" | null
+    message: string | null
+  } | null
 }
 
 export default function MultiplayerStoryPlayPage() {
@@ -85,6 +90,25 @@ export default function MultiplayerStoryPlayPage() {
       const data = await res.json()
       const roomData = data.room as RoomData
       setRoom(roomData)
+
+      // Sync processing state from room (for all participants)
+      if (roomData.isProcessing !== undefined) {
+        setIsProcessing(roomData.isProcessing)
+      }
+
+      // Sync choice feedback from room (for all participants)
+      if (roomData.lastChoiceEvaluation && 
+          roomData.lastChoiceEvaluation.quality && 
+          roomData.lastChoiceEvaluation.message) {
+        setChoiceFeedback({
+          quality: roomData.lastChoiceEvaluation.quality as "excellent" | "good" | "average" | "bad",
+          message: roomData.lastChoiceEvaluation.message,
+        })
+      } else if (!roomData.lastChoiceEvaluation || 
+                 (roomData.lastChoiceEvaluation.quality === null && roomData.lastChoiceEvaluation.message === null)) {
+        // Clear feedback if it's been cleared in the room
+        setChoiceFeedback(null)
+      }
 
       if (roomData.hostId && currentUserId) {
         const hostIdString = typeof roomData.hostId === "string" ? roomData.hostId : roomData.hostId._id?.toString() || roomData.hostId.toString()
@@ -260,24 +284,22 @@ export default function MultiplayerStoryPlayPage() {
 
       const data = await res.json()
       
-      // Show AI review feedback if available
-      if (data.lastChoiceEvaluation) {
-        setChoiceFeedback(data.lastChoiceEvaluation)
-      }
-
       // Check if there's a tie that needs host decision
       if (data.hasTie && data.tiedChoices) {
         setTiedChoices(data.tiedChoices)
         autoProcessRef.current = false
-        setIsProcessing(false)
+        // Don't set isProcessing to false here - let room state handle it
+        // The room's isProcessing will be false since we returned early
+        void fetchRoom() // Refresh room state
         return // Don't continue processing if there's a tie
       }
       
       // Clear tied choices if processing succeeded
       setTiedChoices([])
       
-      // Fetch the updated story from the database to ensure consistency
-      // This ensures all participants see the same story
+      // Fetch the updated story and room to ensure consistency
+      // This ensures all participants see the same story and processing state
+      void fetchRoom() // Refresh room state first to get isProcessing and lastChoiceEvaluation
       const storyRes = await fetch(`/api/stories/${room.storyId}`)
       if (storyRes.ok) {
         const storyData = await storyRes.json()
@@ -308,8 +330,7 @@ export default function MultiplayerStoryPlayPage() {
         }
       }
 
-      // Update room state
-      void fetchRoom()
+      // Room state is already updated via fetchRoom() above
       autoProcessRef.current = false
 
       if (data.story.isStoryComplete) {
@@ -321,9 +342,10 @@ export default function MultiplayerStoryPlayPage() {
       console.error("Error processing choice:", error)
       toast.error("Failed to process choice")
       autoProcessRef.current = false
-    } finally {
-      setIsProcessing(false)
+      // Refresh room state to sync isProcessing flag
+      void fetchRoom()
     }
+    // Don't set isProcessing to false here - let room state handle it via polling
   }, [roomCode, isProcessing, isHost, room?.storyId, story, router])
 
   // Calculate derived values (these are safe to compute even if room/story are null)
@@ -410,7 +432,14 @@ export default function MultiplayerStoryPlayPage() {
       const res = await fetch("/api/stories/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ story: { ...story, id: room.storyId } }),
+        body: JSON.stringify({ 
+          story: { 
+            ...story, 
+            id: room.storyId,
+            isMultiplayer: true,
+            roomCode: roomCode,
+          } 
+        }),
       })
 
       if (!res.ok) {
@@ -418,10 +447,38 @@ export default function MultiplayerStoryPlayPage() {
         return
       }
 
-      toast.success("Story saved!")
+      toast.success("Story saved for all participants!")
     } catch (err) {
       console.error("Save story error", err)
       toast.error("Failed to save story")
+    }
+  }
+
+  const handleExitRoom = async () => {
+    if (!roomCode || isHost) {
+      // Host cannot exit, show message
+      if (isHost) {
+        toast.error("Host cannot leave the room. Please end the story instead.")
+      }
+      return
+    }
+
+    try {
+      const res = await fetch(`/api/multiplayer/rooms/${roomCode}/leave`, {
+        method: "POST",
+      })
+
+      if (!res.ok) {
+        const error = await res.json()
+        toast.error(error.error || "Failed to leave room")
+        return
+      }
+
+      toast.success("Left room successfully")
+      router.push("/dashboard")
+    } catch (error) {
+      console.error("Error leaving room:", error)
+      toast.error("Failed to leave room")
     }
   }
 
@@ -479,6 +536,17 @@ export default function MultiplayerStoryPlayPage() {
               >
                 <Save className="w-4 h-4" />
               </Button>
+              {!isHost && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={handleExitRoom}
+                  className={cn("hover:bg-black/5", theme.styles.text)}
+                  title="Exit Room"
+                >
+                  <LogOut className="w-4 h-4" />
+                </Button>
+              )}
             </div>
           </div>
 

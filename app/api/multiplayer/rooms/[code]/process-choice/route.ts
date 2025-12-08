@@ -100,6 +100,12 @@ export async function POST(
       return NextResponse.json({ error: "Winning choice not found in story" }, { status: 400 })
     }
 
+    // Set processing flag so all participants see the loader
+    // Clear previous evaluation while processing
+    room.isProcessing = true
+    room.lastChoiceEvaluation = { quality: null, message: null }
+    await room.save()
+
     // Generate next part of story
     // For server-side API routes, we need to use the full URL
     const host = request.headers.get('host') || 'localhost:3000'
@@ -124,6 +130,8 @@ export async function POST(
     })
 
     if (!generateResponse.ok) {
+      room.isProcessing = false
+      await room.save()
       throw new Error("Failed to generate next part")
     }
 
@@ -148,12 +156,28 @@ export async function POST(
     // Clear choice votes and update room
     room.choiceVotes = new Map()
     room.currentChoiceIndex = story.currentChoiceIndex
+    room.isProcessing = false // Processing complete
+    // Store last choice evaluation for all participants to see
+    if (storyData.lastChoiceEvaluation) {
+      room.lastChoiceEvaluation = {
+        quality: storyData.lastChoiceEvaluation.quality,
+        message: storyData.lastChoiceEvaluation.message,
+      }
+    } else {
+      room.lastChoiceEvaluation = { quality: null, message: null }
+    }
     if (story.isStoryComplete) {
       room.status = "completed"
       
-      // Save story for all participants with multiplayer tag
+      // Save story for all participants and host with multiplayer tag and room code
       // Do this asynchronously so it doesn't block the response
-      const participants = room.participants.map((p: any) => p.toString())
+      const allUsers = [
+        room.hostId.toString(),
+        ...room.participants.map((p: any) => p.toString()),
+      ]
+      // Remove duplicates
+      const uniqueUsers = [...new Set(allUsers)]
+      
       const storyPayload = {
         title: story.title,
         genre: story.genre,
@@ -165,23 +189,40 @@ export async function POST(
         isStoryComplete: story.isStoryComplete,
         choiceHistory: story.choiceHistory || [],
         isMultiplayer: true,
+        roomCode: room.roomCode,
       }
 
-      // Save for each participant (fire and forget)
+      // Save for each user (fire and forget)
       Promise.all(
-        participants.map(async (participantId: string) => {
+        uniqueUsers.map(async (userId: string) => {
           try {
-            await Story.create({
-              userId: participantId,
-              ...storyPayload,
-              savedAt: new Date(),
+            // Check if story already exists for this user with this roomCode
+            const existing = await Story.findOne({
+              userId: userId,
+              roomCode: room.roomCode,
+              isMultiplayer: true,
             })
+            
+            if (existing) {
+              // Update existing story
+              await Story.findOneAndUpdate(
+                { _id: existing._id, userId: userId },
+                { ...storyPayload, userId: userId, savedAt: new Date() }
+              )
+            } else {
+              // Create new story
+              await Story.create({
+                userId: userId,
+                ...storyPayload,
+                savedAt: new Date(),
+              })
+            }
           } catch (error) {
-            console.error(`Error saving story for participant ${participantId}:`, error)
+            console.error(`Error saving story for user ${userId}:`, error)
           }
         })
       ).catch((error) => {
-        console.error("Error saving stories for participants:", error)
+        console.error("Error saving stories for users:", error)
       })
     }
     await room.save()
@@ -199,6 +240,16 @@ export async function POST(
     })
   } catch (error) {
     console.error("Process choice error:", error)
+    // Reset processing flag on error
+    try {
+      const room = await Room.findOne({ roomCode: code.toUpperCase() })
+      if (room) {
+        room.isProcessing = false
+        await room.save()
+      }
+    } catch (saveError) {
+      console.error("Error resetting processing flag:", saveError)
+    }
     return NextResponse.json({ error: "Internal server error" }, { status: 500 })
   }
 }
