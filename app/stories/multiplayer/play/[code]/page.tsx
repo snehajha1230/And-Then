@@ -12,6 +12,22 @@ import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import { MultiplayerChat } from "@/components/multiplayer-chat"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 
 const GENRE_AUDIO: Record<string, string> = {
   fantasy: "/audio/fantasy.mpeg",
@@ -21,18 +37,37 @@ const GENRE_AUDIO: Record<string, string> = {
   adventure: "/audio/adventure.mpeg",
 }
 
+interface ChatMessage {
+  userId: string
+  username: string
+  message: string
+  timestamp: string | Date
+}
+
 interface RoomData {
   roomCode: string
   status: "waiting" | "voting-genre" | "playing" | "completed"
   hostId: string
+  host?: {
+    _id: string
+    username: string
+    email: string
+  }
+  hostActive?: boolean
   participants: Array<{ _id: string; username: string; email: string }>
   choiceVotes: Record<string, string[]>
   currentChoiceIndex: number
   storyId: string | null
   isProcessing?: boolean
+  tiedChoicesForVoting?: string[]
   lastChoiceEvaluation?: {
     quality: "excellent" | "good" | "average" | "bad" | null
     message: string | null
+  } | null
+  messages?: ChatMessage[]
+  newHostNotification?: {
+    userId: string
+    username: string
   } | null
 }
 
@@ -58,9 +93,22 @@ export default function MultiplayerStoryPlayPage() {
     message: string
   } | null>(null)
   const [tiedChoices, setTiedChoices] = useState<string[]>([])
+  const [isTieBreakerVoting, setIsTieBreakerVoting] = useState(false)
+  const [requiresHostSelection, setRequiresHostSelection] = useState(false)
+  const [showHostTieModal, setShowHostTieModal] = useState(false)
   const autoProcessRef = useRef(false)
   const [isSpeaking, setIsSpeaking] = useState(false)
+  const [showExitDialog, setShowExitDialog] = useState(false)
+  const [isLeavingRoom, setIsLeavingRoom] = useState(false)
+  const [isSavingAndExiting, setIsSavingAndExiting] = useState(false)
+  const [showNewHostModal, setShowNewHostModal] = useState(false)
+  const [newHostInfo, setNewHostInfo] = useState<{ userId: string; username: string } | null>(null)
+  const [showHostTransferDialog, setShowHostTransferDialog] = useState(false)
+  const [selectedNewHost, setSelectedNewHost] = useState<string>("")
+  const [isTransferringHost, setIsTransferringHost] = useState(false)
   const previousChoiceIndexRef = useRef<number>(-1)
+  const previousProcessingStateRef = useRef<boolean>(false)
+  const lastSeenHostNotificationRef = useRef<string | null>(null)
 
   const theme = story ? (BOOK_THEMES[story.genre] || DEFAULT_THEME) : DEFAULT_THEME
 
@@ -79,7 +127,7 @@ export default function MultiplayerStoryPlayPage() {
     void getUserId()
   }, [])
 
-  const fetchRoom = async () => {
+  const fetchRoom = useCallback(async () => {
     try {
       const res = await fetch(`/api/multiplayer/rooms/${roomCode}`)
       if (!res.ok) {
@@ -92,8 +140,25 @@ export default function MultiplayerStoryPlayPage() {
       setRoom(roomData)
 
       // Sync processing state from room (for all participants)
-      if (roomData.isProcessing !== undefined) {
-        setIsProcessing(roomData.isProcessing)
+      // Always sync isProcessing from room state to ensure consistency
+      const roomIsProcessing = roomData.isProcessing || false
+      const wasProcessing = previousProcessingStateRef.current
+      const processingJustCompleted = wasProcessing && !roomIsProcessing
+      
+      if (roomIsProcessing !== isProcessing) {
+        setIsProcessing(roomIsProcessing)
+      }
+      
+      // Update ref for next comparison
+      previousProcessingStateRef.current = roomIsProcessing
+      
+      // If processing just completed, force fetch the updated story for all participants
+      // This ensures participants see the new choices immediately after processing
+      if (processingJustCompleted && roomData.storyId) {
+        console.log("Processing completed, fetching updated story for participants")
+        // Force clear any stuck processing state
+        setIsProcessing(false)
+        // Will fetch story below in the story fetch section
       }
 
       // Sync choice feedback from room (for all participants)
@@ -110,9 +175,32 @@ export default function MultiplayerStoryPlayPage() {
         setChoiceFeedback(null)
       }
 
+      // Sync tie-breaker state
+      if (roomData.tiedChoicesForVoting && roomData.tiedChoicesForVoting.length > 0) {
+        setIsTieBreakerVoting(true)
+        setTiedChoices(roomData.tiedChoicesForVoting)
+      } else {
+        setIsTieBreakerVoting(false)
+        setTiedChoices([])
+        setRequiresHostSelection(false)
+      }
+
       if (roomData.hostId && currentUserId) {
         const hostIdString = typeof roomData.hostId === "string" ? roomData.hostId : roomData.hostId._id?.toString() || roomData.hostId.toString()
         setIsHost(hostIdString === currentUserId)
+      }
+
+      // Check for new host notification
+      if (roomData.newHostNotification && roomData.newHostNotification.userId) {
+        const notificationId = roomData.newHostNotification.userId
+        // Only show if we haven't seen this notification yet
+        if (lastSeenHostNotificationRef.current !== notificationId) {
+          setNewHostInfo(roomData.newHostNotification)
+          setShowNewHostModal(true)
+          lastSeenHostNotificationRef.current = notificationId
+          // Clear the notification on the server after showing
+          void fetch(`/api/multiplayer/rooms/${roomCode}/clear-host-notification`, { method: "POST" }).catch(() => {})
+        }
       }
 
       // If story is complete, redirect
@@ -122,43 +210,105 @@ export default function MultiplayerStoryPlayPage() {
       }
 
       // If story ID exists and status is playing, fetch/update story
+      // Always fetch when processing just completed to ensure participants get updated story
       if (roomData.storyId && roomData.status === "playing") {
-        try {
-          const storyRes = await fetch(`/api/stories/${roomData.storyId}`)
-          if (storyRes.ok) {
-            const storyData = await storyRes.json()
-            const loadedStory = storyData.story as Story
-            
-            if (loadedStory) {
-              // Only reset displayed content when we move to a new page (currentChoiceIndex changes)
-              // This keeps the content visible during voting until the story progresses
-              const hasPageChanged = previousChoiceIndexRef.current !== -1 && 
-                                     previousChoiceIndexRef.current !== loadedStory.currentChoiceIndex
+        // Retry logic for story fetch (handles race conditions after host change)
+        let retryCount = 0
+        const maxRetries = 2
+        let loadedStory: Story | null = null
+        
+        while (retryCount <= maxRetries && !loadedStory) {
+          try {
+            const storyRes = await fetch(`/api/stories/${roomData.storyId}`)
+            if (storyRes.ok) {
+              const storyData = await storyRes.json()
+              loadedStory = storyData.story as Story
               
-              if (hasPageChanged) {
-                // New page - reset for typewriter effect
-                setDisplayedContent("")
-              } else if (previousChoiceIndexRef.current === -1) {
-                // Initial load - reset for typewriter effect
-                setDisplayedContent("")
+              if (loadedStory) {
+                // Always update the story to ensure participants see the latest choices
+                // This is critical when processing completes
+                const previousIndex = previousChoiceIndexRef.current
+                const hasPageChanged = previousIndex !== -1 && 
+                                       previousIndex !== loadedStory.currentChoiceIndex
+                const isInitialLoad = previousIndex === -1
+                
+                // Update story state immediately - this ensures all participants see new choices
+                previousChoiceIndexRef.current = loadedStory.currentChoiceIndex
+                setStory(loadedStory)
+                
+                // Only reset displayed content when we move to a new page, processing just completed, or initial load
+                // This keeps the content visible during voting until the story progresses
+                if (processingJustCompleted || hasPageChanged || isInitialLoad) {
+                  // New page, processing completed, or initial load - reset for typewriter effect and reset auto-process ref
+                  setDisplayedContent("")
+                  autoProcessRef.current = false
+                }
+                // If same page and not just completed processing, keep displayedContent as is
+                
+                setIsLoading(false)
+                break // Success, exit retry loop
+              } else {
+                // Story data is missing - this shouldn't happen, but handle gracefully
+                console.error("Story data is missing in response")
+                if (retryCount < maxRetries) {
+                  retryCount++
+                  await new Promise(resolve => setTimeout(resolve, 500)) // Wait 500ms before retry
+                  continue
+                }
+                setIsLoading(false)
+                break
               }
-              // If same page, keep displayedContent as is (don't reset)
-              
-              previousChoiceIndexRef.current = loadedStory.currentChoiceIndex
-              setStory(loadedStory)
-              setIsLoading(false)
             } else {
-              setIsLoading(false)
+              // If story fetch fails, try to get more details
+              const errorData = await storyRes.json().catch(() => ({}))
+              
+              // If it's a 404 and we haven't exhausted retries, retry (might be race condition after host change)
+              if (storyRes.status === 404 && retryCount < maxRetries) {
+                console.warn(`Story fetch returned 404 (attempt ${retryCount + 1}/${maxRetries + 1}). Retrying...`)
+                retryCount++
+                await new Promise(resolve => setTimeout(resolve, 1000)) // Wait 1s before retry
+                continue
+              }
+              
+              console.error("Failed to fetch story:", errorData)
+              
+              // If it's a 404, the story might not be accessible yet (e.g., after host change)
+              // Keep the existing story if we have one, otherwise show error
+              if (storyRes.status === 404 && story) {
+                // Story exists in state but fetch failed - might be a temporary issue
+                // Keep using existing story and continue polling
+                console.warn("Story fetch returned 404 after retries, but story exists in state. Continuing with existing story.")
+                setIsLoading(false)
+                break
+              } else if (storyRes.status === 404 && !story) {
+                // No story in state and fetch failed - this is a real error
+                toast.error("Story not found. Please refresh the page.")
+                setIsLoading(false)
+                break
+              } else {
+                // Other error - log and continue
+                setIsLoading(false)
+                break
+              }
             }
-          } else {
-            // If story fetch fails, log error and set loading to false
-            const errorData = await storyRes.json().catch(() => ({}))
-            console.error("Failed to fetch story:", errorData)
-            setIsLoading(false)
+          } catch (error) {
+            console.error("Error fetching story:", error)
+            if (retryCount < maxRetries) {
+              retryCount++
+              await new Promise(resolve => setTimeout(resolve, 1000)) // Wait 1s before retry
+              continue
+            }
+            // On network error, keep existing story if available
+            if (story) {
+              console.warn("Network error fetching story after retries, but story exists in state. Continuing.")
+              setIsLoading(false)
+              break
+            } else {
+              toast.error("Failed to load story. Please refresh the page.")
+              setIsLoading(false)
+              break
+            }
           }
-        } catch (error) {
-          console.error("Error fetching story:", error)
-          setIsLoading(false)
         }
       } else if (roomData.status !== "playing") {
         // If room is not in playing state, stop loading
@@ -172,7 +322,7 @@ export default function MultiplayerStoryPlayPage() {
       console.error("Error fetching room:", error)
       setIsLoading(false)
     }
-  }
+  }, [roomCode, currentUserId, router])
 
   useEffect(() => {
     if (!roomCode) return
@@ -263,9 +413,18 @@ export default function MultiplayerStoryPlayPage() {
     }
   }
 
+  const storyId = room?.storyId // Extract to stable value outside callback
   const handleProcessChoice = useCallback(async (selectedChoiceId?: string) => {
-    if (!roomCode || isProcessing || !isHost || !room?.storyId) return
-
+    if (!roomCode || !isHost || !storyId) {
+      console.log("handleProcessChoice blocked:", { roomCode, isHost, storyId })
+      autoProcessRef.current = false
+      return
+    }
+    if (isProcessing) {
+      console.log("handleProcessChoice blocked: already processing")
+      autoProcessRef.current = false
+      return
+    }
     setIsProcessing(true)
     try {
       const res = await fetch(`/api/multiplayer/rooms/${roomCode}/process-choice`, {
@@ -284,23 +443,39 @@ export default function MultiplayerStoryPlayPage() {
 
       const data = await res.json()
       
-      // Check if there's a tie that needs host decision
+      // Check if there's a tie that needs tie-breaker voting
       if (data.hasTie && data.tiedChoices) {
-        setTiedChoices(data.tiedChoices)
+        if (data.isTieBreakerVoting) {
+          // Tie-breaker voting initiated - show tied choices to everyone
+          setIsTieBreakerVoting(true)
+          setTiedChoices(data.tiedChoices)
+          setRequiresHostSelection(false)
+        } else if (data.requiresHostSelection) {
+          // Still tied after tie-breaker - host must select
+          setIsTieBreakerVoting(true)
+          setTiedChoices(data.tiedChoices)
+          setRequiresHostSelection(true)
+        } else {
+          // Initial tie - will be handled by setting tiedChoicesForVoting
+          setIsTieBreakerVoting(true)
+          setTiedChoices(data.tiedChoices)
+          setRequiresHostSelection(false)
+        }
         autoProcessRef.current = false
-        // Don't set isProcessing to false here - let room state handle it
-        // The room's isProcessing will be false since we returned early
+        setIsProcessing(false) // Reset processing state when tie is detected
         void fetchRoom() // Refresh room state
         return // Don't continue processing if there's a tie
       }
       
       // Clear tied choices if processing succeeded
       setTiedChoices([])
+      setIsTieBreakerVoting(false)
+      setRequiresHostSelection(false)
       
       // Fetch the updated story and room to ensure consistency
       // This ensures all participants see the same story and processing state
       void fetchRoom() // Refresh room state first to get isProcessing and lastChoiceEvaluation
-      const storyRes = await fetch(`/api/stories/${room.storyId}`)
+      const storyRes = await fetch(`/api/stories/${storyId}`)
       if (storyRes.ok) {
         const storyData = await storyRes.json()
         const updatedStory = storyData.story as Story
@@ -314,9 +489,10 @@ export default function MultiplayerStoryPlayPage() {
         }
       } else {
         // Fallback to response data if fetch fails
-        if (story) {
+        const currentStory = story // Capture current story
+        if (currentStory) {
           const updatedStory: Story = {
-            ...story,
+            ...currentStory,
             content: data.story.content,
             choices: data.story.choices,
             currentChoiceIndex: data.story.currentChoiceIndex,
@@ -332,21 +508,62 @@ export default function MultiplayerStoryPlayPage() {
 
       // Room state is already updated via fetchRoom() above
       autoProcessRef.current = false
+      // Reset processing state - room state will be synced via fetchRoom
+      // But we reset it here to allow next auto-process to trigger
+      setIsProcessing(false)
 
       if (data.story.isStoryComplete) {
         setTimeout(() => {
-          router.push(`/stories/complete/${room.storyId}`)
+          router.push(`/stories/complete/${storyId}`)
         }, 1500)
       }
     } catch (error) {
       console.error("Error processing choice:", error)
       toast.error("Failed to process choice")
       autoProcessRef.current = false
+      setIsProcessing(false)
       // Refresh room state to sync isProcessing flag
       void fetchRoom()
     }
-    // Don't set isProcessing to false here - let room state handle it via polling
-  }, [roomCode, isProcessing, isHost, room?.storyId, story, router])
+  }, [roomCode, isProcessing, isHost, storyId, router, fetchRoom])
+
+  // Helper function to get usernames from user IDs
+  // IMPORTANT: Also check hostId since new hosts are removed from participants array
+  const getUsernamesForVotes = useCallback((userIds: string[]): string[] => {
+    if (!room) return []
+    
+    // Get host ID string for comparison
+    const hostIdString = room.hostId || null
+    
+    return userIds
+      .map((userId) => {
+        // First check if this is the host
+        if (hostIdString && userId === hostIdString) {
+          // Use host info from room data (includes username/email)
+          if (room.host) {
+            return room.host.username || room.host.email || "Unknown"
+          }
+          // Fallback if host info not available
+          return "Unknown"
+        }
+        
+        // Check participants array
+        if (room.participants) {
+          const participant = room.participants.find(
+            (p) => {
+              const pId = typeof p === "object" && p._id ? p._id.toString() : p.toString()
+              return pId === userId
+            }
+          )
+          if (participant) {
+            return participant.username || participant.email || "Unknown"
+          }
+        }
+        
+        return "Unknown"
+      })
+      .filter(Boolean)
+  }, [room])
 
   // Calculate derived values (these are safe to compute even if room/story are null)
   const userVote = room?.choiceVotes
@@ -356,44 +573,164 @@ export default function MultiplayerStoryPlayPage() {
     : null
 
   // Check if all participants have voted
-  const totalVotes = room?.choiceVotes
-    ? Object.values(room.choiceVotes).reduce((sum, votes) => sum + votes.length, 0)
-    : 0
-  const allVoted = room && room.participants.length > 0 && totalVotes >= room.participants.length
+  // Count unique voters, not total votes (since each person votes once)
+  const uniqueVoters = new Set<string>()
+  if (room?.choiceVotes) {
+    if (isTieBreakerVoting && tiedChoices.length > 0) {
+      // Only count votes for tied choices in tie-breaker mode
+      tiedChoices.forEach((choiceId) => {
+        const votes = room.choiceVotes[choiceId] || []
+        votes.forEach((userId: string) => uniqueVoters.add(userId))
+      })
+    } else {
+      // Count all votes in normal mode
+      Object.values(room.choiceVotes).forEach((votes: string[]) => {
+        votes.forEach((userId: string) => uniqueVoters.add(userId))
+      })
+    }
+  }
+  const totalVotes = uniqueVoters.size
+  // Total players = participants (host may or may not be in participants array)
+  // Check if host is already in participants to avoid double counting
+  const hostIdString = room?.hostId ? (typeof room.hostId === "string" ? room.hostId : room.hostId.toString()) : null
+  const hostInParticipants = hostIdString && room?.participants.some(
+    (p: any) => {
+      const pId = typeof p === "string" ? p : (p._id ? p._id.toString() : p.toString())
+      return pId === hostIdString
+    }
+  )
+  const hostTransferCandidates =
+    room?.participants.filter((p) => {
+      const pId = typeof p === "object" && p._id ? p._id.toString() : p.toString()
+      return !hostIdString || pId !== hostIdString
+    }) || []
+  // If host is active and not in participants, add 1. Otherwise just use participants.length
+  const totalPlayers = room ? (
+    room.participants.length + (room.hostActive !== false && !hostInParticipants ? 1 : 0)
+  ) : 0
+  const allVoted = room && totalPlayers > 0 && totalVotes >= totalPlayers
 
   // Calculate vote counts and check for ties
-  const voteCounts = story?.choices.map((choice) => {
+  // If in tie-breaker mode, only show tied choices
+  const choicesToShow = isTieBreakerVoting && tiedChoices.length > 0 
+    ? story?.choices.filter(c => tiedChoices.includes(c.id)) || []
+    : story?.choices || []
+
+  const voteCounts = choicesToShow.map((choice) => {
     const votes = room?.choiceVotes[choice.id] || []
     return { choiceId: choice.id, votes: votes.length }
-  }) || []
+  })
   const maxVotes = voteCounts.length > 0 ? Math.max(...voteCounts.map((v) => v.votes), 0) : 0
   const tiedChoicesList = voteCounts
     .filter((v) => v.votes === maxVotes && v.votes > 0)
     .map((v) => v.choiceId)
-  const hasTie = tiedChoicesList.length > 1 && allVoted
-
-  // Update tiedChoices state when room data changes
+  const hasTie = tiedChoicesList.length > 1 && allVoted && !isTieBreakerVoting
+  const hasTieAfterBreaker = tiedChoicesList.length > 1 && allVoted && isTieBreakerVoting
+  
+  // Update requiresHostSelection based on tie after tie-breaker
   useEffect(() => {
-    if (hasTie && tiedChoicesList.length > 0) {
-      setTiedChoices(tiedChoicesList)
-    } else if (!hasTie) {
-      setTiedChoices([])
+    if (hasTieAfterBreaker && isTieBreakerVoting) {
+      setRequiresHostSelection(true)
+    } else if (!hasTieAfterBreaker && isTieBreakerVoting) {
+      setRequiresHostSelection(false)
     }
-  }, [hasTie, tiedChoicesList.join(",")])
+  }, [hasTieAfterBreaker, isTieBreakerVoting])
 
-  // Auto-proceed when all voted and no tie (only once)
+  // Open/close host tie modal when host selection is needed
   useEffect(() => {
-    if (allVoted && !hasTie && !isProcessing && !autoProcessRef.current && isHost && tiedChoices.length === 0 && room && story) {
+    if (requiresHostSelection && isHost) {
+      setShowHostTieModal(true)
+    } else {
+      setShowHostTieModal(false)
+    }
+  }, [requiresHostSelection, isHost])
+
+  // Auto-run processing after everyone has voted.
+  // This always hits the server so it can either advance the story or initiate tie-break flows.
+  useEffect(() => {
+    // Skip if not host or missing required data
+    if (!isHost || !room || !story || !storyId) {
+      autoProcessRef.current = false
+      return
+    }
+    
+    // If all have voted but we're stuck in processing state, reset it
+    // This handles cases where processing state got stuck
+    if (allVoted && isProcessing && room.isProcessing === false) {
+      console.log("Resetting stuck isProcessing state")
+      setIsProcessing(false)
+      autoProcessRef.current = false
+      return
+    }
+    
+    const roomIsProcessing = room.isProcessing || false
+    
+    // Reset autoProcessRef if it's stuck (allVoted is true, not processing, but ref is true)
+    // This can happen if the timeout callback never executed or handleProcessChoice returned early
+    if (allVoted && !isProcessing && !roomIsProcessing && autoProcessRef.current && !requiresHostSelection) {
+      console.log("Resetting stuck autoProcessRef - conditions are met but ref is still true")
+      autoProcessRef.current = false
+    }
+    
+    // Always trigger processing once everyone has voted so the server can:
+    // - advance the story when there is a clear winner
+    // - kick off tie-breaker voting when there is a tie
+    // Block only when the host must make a manual selection after a second tie.
+    const shouldAutoProcess =
+      allVoted &&
+      !isProcessing &&
+      !roomIsProcessing &&
+      !autoProcessRef.current &&
+      !requiresHostSelection
+
+    if (shouldAutoProcess) {
+      console.log("Auto-process conditions met, triggering in 500ms")
       autoProcessRef.current = true
       // Small delay to ensure UI updates
       const timer = setTimeout(() => {
-        void handleProcessChoice()
+        // Double-check conditions before processing
+        // Use current room state, not closure values
+        const currentRoom = room
+        const currentStory = story
+        const currentIsProcessing = isProcessing
+        if (!currentIsProcessing && isHost && storyId && currentRoom && currentStory) {
+          console.log("Auto-processing choice - triggering handleProcessChoice")
+          void handleProcessChoice()
+        } else {
+          console.log("Auto-process blocked at execution:", { 
+            isProcessing: currentIsProcessing, 
+            isHost, 
+            storyId, 
+            hasRoom: !!currentRoom, 
+            hasStory: !!currentStory 
+          })
+          autoProcessRef.current = false
+        }
       }, 500)
-      return () => clearTimeout(timer)
+      return () => {
+        clearTimeout(timer)
+        // Reset ref if component unmounts or effect re-runs before timeout
+        if (autoProcessRef.current) {
+          autoProcessRef.current = false
+        }
+      }
     } else if (!allVoted) {
+      // Reset auto-process flag if voting changes
       autoProcessRef.current = false
+    } else if (allVoted && autoProcessRef.current) {
+      // Log why auto-process is not triggering when ref is stuck
+      console.log("Auto-process not triggering (ref stuck):", {
+        allVoted,
+        hasTie,
+        hasTieAfterBreaker,
+        isProcessing,
+        roomIsProcessing,
+        autoProcessRef: autoProcessRef.current,
+        requiresHostSelection,
+        isTieBreakerVoting
+      })
     }
-  }, [allVoted, hasTie, isProcessing, isHost, tiedChoices.length, handleProcessChoice, room, story])
+  }, [allVoted, hasTie, hasTieAfterBreaker, isProcessing, isHost, requiresHostSelection, isTieBreakerVoting, handleProcessChoice, room, story, storyId])
 
   // Auto-hide choice feedback after a short delay
   useEffect(() => {
@@ -425,8 +762,8 @@ export default function MultiplayerStoryPlayPage() {
     window.speechSynthesis.speak(utterance)
   }
 
-  const handleSaveStory = async () => {
-    if (!story || !room?.storyId) return
+  const handleSaveStory = async (options?: { suppressSuccessToast?: boolean }) => {
+    if (!story || !room?.storyId) return false
 
     try {
       const res = await fetch("/api/stories/save", {
@@ -444,41 +781,111 @@ export default function MultiplayerStoryPlayPage() {
 
       if (!res.ok) {
         toast.error("Failed to save story")
-        return
+        return false
       }
 
-      toast.success("Story saved for all participants!")
+      if (!options?.suppressSuccessToast) {
+        toast.success("Story saved to your multiplayer library")
+      }
+      return true
     } catch (err) {
       console.error("Save story error", err)
       toast.error("Failed to save story")
+      return false
     }
   }
 
-  const handleExitRoom = async () => {
-    if (!roomCode || isHost) {
-      // Host cannot exit, show message
-      if (isHost) {
-        toast.error("Host cannot leave the room. Please end the story instead.")
-      }
-      return
-    }
-
+  const leaveRoom = async (saveAndExit: boolean = false) => {
+    if (!roomCode) return false
     try {
       const res = await fetch(`/api/multiplayer/rooms/${roomCode}/leave`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ saveAndExit }),
       })
 
       if (!res.ok) {
-        const error = await res.json()
+        const error = await res.json().catch(() => ({}))
         toast.error(error.error || "Failed to leave room")
-        return
+        return false
       }
 
-      toast.success("Left room successfully")
-      router.push("/dashboard")
+      return true
     } catch (error) {
       console.error("Error leaving room:", error)
       toast.error("Failed to leave room")
+      return false
+    }
+  }
+
+  const handleExitClick = () => {
+    // Hosts must pick a successor when other participants are present
+    if (isHost && hostTransferCandidates.length > 0) {
+      const firstCandidate = hostTransferCandidates[0]
+      const firstId =
+        typeof firstCandidate === "object" && (firstCandidate as any)._id
+          ? (firstCandidate as any)._id.toString()
+          : (firstCandidate as any).toString()
+      setSelectedNewHost(firstId)
+      setShowHostTransferDialog(true)
+      return
+    }
+    setShowExitDialog(true)
+  }
+
+  const handleConfirmHostTransfer = async () => {
+    if (!roomCode) return
+    if (!selectedNewHost) {
+      toast.error("Choose who should become the new host")
+      return
+    }
+    setIsTransferringHost(true)
+    try {
+      const res = await fetch(`/api/multiplayer/rooms/${roomCode}/transfer-host`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ newHostId: selectedNewHost }),
+      })
+
+      if (!res.ok) {
+        const error = await res.json().catch(() => ({}))
+        toast.error(error.error || "Failed to transfer host powers")
+        return
+      }
+
+      toast.success("Host powers transferred")
+      await fetchRoom()
+      setIsHost(false)
+      setShowHostTransferDialog(false)
+      setShowExitDialog(true)
+    } finally {
+      setIsTransferringHost(false)
+    }
+  }
+
+  const handleExit = async (mode: "exit" | "save-exit") => {
+    if (!roomCode) return
+    setShowExitDialog(false)
+    setIsLeavingRoom(true)
+    if (mode === "save-exit") {
+      setIsSavingAndExiting(true)
+    }
+
+    try {
+      // When save-exit is chosen, the leave route will save the story for this user
+      // No need to call handleSaveStory separately
+      const left = await leaveRoom(mode === "save-exit")
+      if (!left) return
+
+      toast.success(
+        mode === "save-exit"
+          ? "Story saved to your multiplayer library. You left the room and can rejoin later."
+          : "Exited the room. You will not be able to rejoin this session.",
+      )
+      router.push("/dashboard")
+    } finally {
+      setIsLeavingRoom(false)
+      setIsSavingAndExiting(false)
     }
   }
 
@@ -493,12 +900,16 @@ export default function MultiplayerStoryPlayPage() {
     )
   }
 
+  // Use the totalPlayers calculated above (includes host if active)
+  // This is already calculated earlier in the component
+
   return (
-    <BookLayout
-      genre={story.genre}
-      currentPage={story.currentChoiceIndex}
-      onPageTurn={() => {}}
-      leftContent={
+    <>
+      <BookLayout
+        genre={story.genre}
+        currentPage={story.currentChoiceIndex}
+        onPageTurn={() => {}}
+        leftContent={
         <div className="flex flex-col h-full">
           <div className="flex items-center justify-between mb-6 border-b pb-4 border-black/10">
             <Link href="/dashboard">
@@ -512,7 +923,7 @@ export default function MultiplayerStoryPlayPage() {
               <div className="flex items-center gap-1 px-3 py-1 rounded-lg bg-primary/10 border border-primary/30">
                 <Users className="w-4 h-4 text-primary" />
                 <span className="text-xs font-display text-primary">
-                  {room.participants.length} players
+                  {totalPlayers} players
                 </span>
               </div>
               <Button
@@ -531,22 +942,21 @@ export default function MultiplayerStoryPlayPage() {
               <Button
                 variant="ghost"
                 size="icon"
-                onClick={handleSaveStory}
+                onClick={() => void handleSaveStory()}
                 className={cn("hover:bg-black/5", theme.styles.text)}
               >
                 <Save className="w-4 h-4" />
               </Button>
-              {!isHost && (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={handleExitRoom}
-                  className={cn("hover:bg-black/5", theme.styles.text)}
-                  title="Exit Room"
-                >
-                  <LogOut className="w-4 h-4" />
-                </Button>
-              )}
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => handleExitClick()}
+                className={cn("hover:bg-black/5", theme.styles.text)}
+                title="Exit Room"
+                disabled={isLeavingRoom || isSavingAndExiting}
+              >
+                <LogOut className="w-4 h-4" />
+              </Button>
             </div>
           </div>
 
@@ -579,16 +989,36 @@ export default function MultiplayerStoryPlayPage() {
         <div className="flex flex-col h-full justify-center">
           {!isTyping && (
             <div className="space-y-6">
-              {!hasTie && (
+              {!isTieBreakerVoting && (
                 <p className={cn("text-sm font-bold opacity-70 mb-4 uppercase tracking-widest text-center", theme.styles.text)}>
                   Vote for what happens next
                 </p>
               )}
 
-              {!hasTie && story.choices.map((choice) => {
+              {isTieBreakerVoting && !requiresHostSelection && (
+                <p className={cn("text-sm font-bold opacity-70 mb-4 uppercase tracking-widest text-center", theme.styles.text)}>
+                  There was a tie—vote again between the tied choices
+                </p>
+              )}
+
+              {isTieBreakerVoting && requiresHostSelection && isHost && (
+                <p className={cn("text-sm font-bold opacity-70 mb-4 uppercase tracking-widest text-center", theme.styles.text)}>
+                  Still tied! Select the final choice
+                </p>
+              )}
+
+              {isTieBreakerVoting && requiresHostSelection && !isHost && (
+                <p className={cn("text-sm font-bold opacity-70 mb-4 uppercase tracking-widest text-center", theme.styles.text)}>
+                  Still tied! Waiting for host to select...
+                </p>
+              )}
+
+              {/* Show choices - either all choices or only tied choices in tie-breaker mode */}
+              {!isTieBreakerVoting && story.choices.map((choice) => {
                 const votes = room.choiceVotes[choice.id] || []
                 const voteCount = votes.length
                 const isUserVote = userVote === choice.id
+                const voterUsernames = getUsernamesForVotes(votes)
 
                 return (
                   <button
@@ -610,8 +1040,18 @@ export default function MultiplayerStoryPlayPage() {
                     </div>
                     {voteCount > 0 && (
                       <div className="mt-3 pt-3 border-t border-primary/20">
-                        <div className="text-sm font-display text-primary">
-                          {voteCount} {voteCount === 1 ? "vote" : "votes"}
+                        <div className="text-xs font-medium text-primary/70 mb-1">
+                          Voted by:
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {voterUsernames.map((username, idx) => (
+                            <span
+                              key={idx}
+                              className="inline-flex items-center px-2 py-0.5 rounded-md bg-primary/10 text-xs font-display text-primary border border-primary/20"
+                            >
+                              {username}
+                            </span>
+                          ))}
                         </div>
                       </div>
                     )}
@@ -624,16 +1064,69 @@ export default function MultiplayerStoryPlayPage() {
                 )
               })}
 
-              {/* Tie-breaker UI (Host only, when there's a tie) */}
-              {isHost && hasTie && tiedChoices.length > 0 && !isProcessing && (
-                <div className="mt-8 space-y-4">
-                  <p className={cn("text-sm font-bold opacity-70 mb-4 uppercase tracking-widest text-center", theme.styles.text)}>
-                    Tie! Select the final choice
-                  </p>
+              {/* Tie-breaker voting UI - show tied choices to everyone */}
+              {isTieBreakerVoting && !requiresHostSelection && tiedChoices.length > 0 && (
+                <div className="space-y-4">
+                  {choicesToShow.map((choice) => {
+                    const votes = room.choiceVotes[choice.id] || []
+                    const voteCount = votes.length
+                    const isUserVote = userVote === choice.id
+                    const voterUsernames = getUsernamesForVotes(votes)
+
+                    return (
+                      <button
+                        key={choice.id}
+                        onClick={() => handleVoteChoice(choice.id)}
+                        disabled={isVoting || isProcessing}
+                        className={cn(
+                          "w-full text-left p-6 rounded-lg border-2 transition-all duration-200 transform hover:-translate-y-1 hover:shadow-md active:translate-y-0 group relative",
+                          theme.styles.choice,
+                          theme.styles.text,
+                          isUserVote && "ring-2 ring-primary",
+                        )}
+                      >
+                        <div className="flex items-start gap-4">
+                          <span className="font-bold opacity-50 text-xl group-hover:opacity-100 transition-opacity">
+                            {story.choices.indexOf(choice) + 1}.
+                          </span>
+                          <span className="text-lg flex-1">{choice.text}</span>
+                        </div>
+                        {voteCount > 0 && (
+                          <div className="mt-3 pt-3 border-t border-primary/20">
+                            <div className="text-xs font-medium text-primary/70 mb-1">
+                              Voted by:
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {voterUsernames.map((username, idx) => (
+                                <span
+                                  key={idx}
+                                  className="inline-flex items-center px-2 py-0.5 rounded-md bg-primary/10 text-xs font-display text-primary border border-primary/20"
+                                >
+                                  {username}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {isUserVote && (
+                          <div className="absolute top-2 right-2 text-xs text-primary uppercase tracking-wider">
+                            Your Vote
+                          </div>
+                        )}
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+
+              {/* Host selection UI - when still tied after tie-breaker */}
+              {isTieBreakerVoting && requiresHostSelection && isHost && tiedChoices.length > 0 && !isProcessing && (
+                <div className="space-y-4">
                   {tiedChoices.map((choiceId) => {
                     const choice = story.choices.find((c) => c.id === choiceId)
                     if (!choice) return null
                     const votes = room.choiceVotes[choice.id] || []
+                    const voterUsernames = getUsernamesForVotes(votes)
                     return (
                       <button
                         key={choiceId}
@@ -651,35 +1144,41 @@ export default function MultiplayerStoryPlayPage() {
                           </span>
                           <span className="text-lg flex-1">{choice.text}</span>
                         </div>
-                        <div className="mt-3 pt-3 border-t border-primary/20">
-                          <div className="text-sm font-display text-primary">
-                            {votes.length} {votes.length === 1 ? "vote" : "votes"}
+                        {votes.length > 0 && (
+                          <div className="mt-3 pt-3 border-t border-primary/20">
+                            <div className="text-xs font-medium text-primary/70 mb-1">
+                              Voted by:
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {voterUsernames.map((username, idx) => (
+                                <span
+                                  key={idx}
+                                  className="inline-flex items-center px-2 py-0.5 rounded-md bg-primary/10 text-xs font-display text-primary border border-primary/20"
+                                >
+                                  {username}
+                                </span>
+                              ))}
+                            </div>
                           </div>
-                        </div>
+                        )}
                       </button>
                     )
                   })}
                 </div>
               )}
 
-              {/* Process Choice Button (Host only, when all voted and no tie) */}
-              {isHost && allVoted && !hasTie && !isProcessing && tiedChoices.length === 0 && (
-                <div className="mt-8">
-                  <NeonButton
-                    glowColor="violet"
-                    onClick={() => handleProcessChoice()}
-                    className="w-full"
-                  >
-                    <Play className="w-5 h-5 mr-2" />
-                    Continue Story
-                  </NeonButton>
+              {!isTieBreakerVoting && !allVoted && (
+                <div className="mt-4 text-center">
+                  <p className={cn("text-sm opacity-60", theme.styles.text)}>
+                    Waiting for all players to vote... ({totalVotes}/{totalPlayers})
+                  </p>
                 </div>
               )}
 
-              {isHost && !allVoted && (
+              {isTieBreakerVoting && !requiresHostSelection && !allVoted && (
                 <div className="mt-4 text-center">
                   <p className={cn("text-sm opacity-60", theme.styles.text)}>
-                    Waiting for all players to vote...
+                    Waiting for all players to vote on tied choices... ({totalVotes}/{totalPlayers})
                   </p>
                 </div>
               )}
@@ -709,9 +1208,273 @@ export default function MultiplayerStoryPlayPage() {
               </div>
             </div>
           )}
+
+          {/* Host tie modal for final selection */}
+          {showHostTieModal && isHost && tiedChoices.length > 0 && (
+            <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/60 backdrop-blur-md animate-in fade-in duration-200">
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                transition={{ duration: 0.2 }}
+                className="bg-white dark:bg-neutral-900 rounded-2xl shadow-2xl max-w-2xl w-full mx-4 border border-primary/20"
+              >
+                <div className="p-6 border-b border-primary/10 bg-gradient-to-r from-primary/5 to-primary/10">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center">
+                      <Users className="w-5 h-5 text-primary" />
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-display font-bold text-foreground">Tie Detected Again</h3>
+                      <p className="text-sm text-foreground/70 mt-0.5">
+                        Select the final choice to continue the story
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                <div className="p-6 space-y-3 max-h-96 overflow-y-auto">
+                  {tiedChoices.map((choiceId) => {
+                    const choice = story.choices.find((c) => c.id === choiceId)
+                    if (!choice) return null
+                    const votes = room.choiceVotes[choice.id] || []
+                    const voterUsernames = getUsernamesForVotes(votes)
+                    return (
+                      <motion.button
+                        key={choiceId}
+                        onClick={() => {
+                          setShowHostTieModal(false)
+                          void handleProcessChoice(choiceId)
+                        }}
+                        whileHover={{ scale: 1.02 }}
+                        whileTap={{ scale: 0.98 }}
+                        className={cn(
+                          "w-full text-left p-5 rounded-xl border-2 transition-all duration-200",
+                          theme.styles.choice,
+                          theme.styles.text,
+                          "ring-2 ring-primary hover:ring-primary/80 hover:shadow-lg"
+                        )}
+                      >
+                        <div className="flex items-start gap-3 mb-3">
+                          <span className="font-bold text-lg opacity-70">{story.choices.indexOf(choice) + 1}.</span>
+                          <span className="text-base flex-1 font-medium leading-relaxed">{choice.text}</span>
+                        </div>
+                        {votes.length > 0 && (
+                          <div className="mt-3 pt-3 border-t border-primary/20">
+                            <div className="text-xs font-semibold text-primary/80 mb-2 uppercase tracking-wider">
+                              Voted by ({votes.length}):
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {voterUsernames.map((username, idx) => (
+                                <span
+                                  key={idx}
+                                  className="inline-flex items-center px-3 py-1 rounded-lg bg-primary/15 text-xs font-display text-primary border border-primary/30"
+                                >
+                                  {username}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </motion.button>
+                    )
+                  })}
+                </div>
+                <div className="p-4 border-t border-primary/10 bg-neutral-50/50 dark:bg-neutral-800/50 flex justify-end">
+                  <Button 
+                    variant="ghost" 
+                    size="sm" 
+                    onClick={() => setShowHostTieModal(false)}
+                    className="hover:bg-primary/10"
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </motion.div>
+            </div>
+          )}
         </div>
       }
     />
+      <AlertDialog open={showHostTransferDialog} onOpenChange={setShowHostTransferDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Choose a new host</AlertDialogTitle>
+            <AlertDialogDescription>
+              Select which participant should take over host controls before you exit. You will continue as a regular player afterward.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {hostTransferCandidates.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No other participants are available to take host duties right now.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {hostTransferCandidates.map((candidate) => {
+                const candidateId =
+                  typeof candidate === "object" && (candidate as any)._id
+                    ? (candidate as any)._id.toString()
+                    : (candidate as any).toString()
+                const label =
+                  typeof candidate === "object" && "username" in candidate
+                    ? (candidate as any).username || (candidate as any).email || "Unknown"
+                    : "Unknown"
+                const isSelected = selectedNewHost === candidateId
+                return (
+                  <button
+                    key={candidateId}
+                    onClick={() => setSelectedNewHost(candidateId)}
+                    className={cn(
+                      "w-full text-left p-3 rounded-lg border transition-colors",
+                      isSelected ? "border-primary bg-primary/10" : "border-border hover:bg-muted/50",
+                    )}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium">{label}</span>
+                      {isSelected && <span className="text-xs text-primary font-semibold">Selected</span>}
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+          <AlertDialogFooter className="gap-2 mt-4">
+            <AlertDialogCancel disabled={isTransferringHost}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={isTransferringHost || !selectedNewHost || hostTransferCandidates.length === 0}
+              onClick={() => void handleConfirmHostTransfer()}
+            >
+              {isTransferringHost ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Transferring...
+                </>
+              ) : (
+                "Transfer host"
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog open={showExitDialog} onOpenChange={setShowExitDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Exit Room</AlertDialogTitle>
+            <AlertDialogDescription>
+              Exit without saving to leave permanently, or save and exit to keep your copy and rejoin later. Remaining players continue from the current page.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="gap-2">
+            <AlertDialogCancel disabled={isLeavingRoom || isSavingAndExiting}>Cancel</AlertDialogCancel>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex">
+                  <AlertDialogAction
+                    disabled={isLeavingRoom || isSavingAndExiting}
+                    onClick={() => void handleExit("exit")}
+                    className="min-w-[120px]"
+                  >
+                    {isLeavingRoom ? (
+                      <>
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        Exiting...
+                      </>
+                    ) : (
+                      "Exit"
+                    )}
+                  </AlertDialogAction>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-[250px]">
+                <p className="text-xs">
+                  Leave immediately. The story will not be saved for you and you will not be able to rejoin this room.
+                </p>
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex">
+                  <AlertDialogAction
+                    disabled={isLeavingRoom || isSavingAndExiting}
+                    onClick={() => void handleExit("save-exit")}
+                    className="bg-primary text-primary-foreground hover:bg-primary/90 min-w-[150px]"
+                  >
+                    {isSavingAndExiting ? (
+                      <>
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        Saving...
+                      </>
+                    ) : (
+                      "Save and Exit"
+                    )}
+                  </AlertDialogAction>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-[250px]">
+                <p className="text-xs">
+                  Save to your multiplayer library, exit the room, and rejoin later with voting rights restored.
+                </p>
+              </TooltipContent>
+            </Tooltip>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* New Host Notification Modal */}
+      {showNewHostModal && newHostInfo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-md animate-in fade-in duration-200">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            transition={{ duration: 0.2 }}
+            className="bg-white dark:bg-neutral-900 rounded-2xl shadow-2xl max-w-md w-full mx-4 border border-primary/20"
+          >
+            <div className="p-6 border-b border-primary/10 bg-gradient-to-r from-primary/5 to-primary/10">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center">
+                  <Users className="w-5 h-5 text-primary" />
+                </div>
+                <div>
+                  <h3 className="text-xl font-display font-bold text-foreground">New Host Selected</h3>
+                  <p className="text-sm text-foreground/70 mt-0.5">
+                    The previous host has left the room
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div className="p-6">
+              <p className="text-center text-lg mb-4">
+                <span className="font-display font-bold text-primary">{newHostInfo.username}</span> is now the host
+              </p>
+              <p className="text-sm text-foreground/60 text-center">
+                They will manage voting and story progression
+              </p>
+            </div>
+            <div className="p-4 border-t border-primary/10 bg-neutral-50/50 dark:bg-neutral-800/50 flex justify-end">
+              <Button 
+                variant="default" 
+                size="sm" 
+                onClick={() => setShowNewHostModal(false)}
+                className="bg-primary text-primary-foreground hover:bg-primary/90"
+              >
+                Got it
+              </Button>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* Multiplayer Chat */}
+      {room && (
+        <MultiplayerChat
+          roomCode={roomCode}
+          currentUserId={currentUserId}
+          messages={room.messages || []}
+          onMessageSent={() => {
+            // Refresh room to get latest messages
+            void fetchRoom()
+          }}
+        />
+      )}
+    </>
   )
 }
 

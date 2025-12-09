@@ -24,6 +24,9 @@ export async function GET(request: NextRequest) {
       PersonalityProfile.findOne({ userId }).lean(),
     ])
 
+    const multiplayerStories = stories.filter((story: any) => story.isMultiplayer)
+    const singlePlayerStories = stories.filter((story: any) => !story.isMultiplayer)
+
     const normalizeScores = (s: any) => {
       if (!s) return {}
       if (Array.isArray(s)) return Object.fromEntries(s)
@@ -83,7 +86,9 @@ export async function GET(request: NextRequest) {
         username: user.username,
         email: user.email,
       },
-      stories,
+      stories, // kept for backward compatibility
+      singlePlayerStories,
+      multiplayerStories,
       personality: personalityResult,
     }
 

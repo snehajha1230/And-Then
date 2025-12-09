@@ -39,7 +39,15 @@ interface DashboardApiResponse {
   }
   user: CurrentUser
   stories: Story[]
+  singlePlayerStories?: Story[]
+  multiplayerStories?: Story[]
   personality: PersonalityResult | null
+}
+
+type SavedStory = Story & {
+  _id?: string
+  isMultiplayer?: boolean
+  roomCode?: string | null
 }
 
 export default function DashboardPage() {
@@ -48,7 +56,8 @@ export default function DashboardPage() {
   const userIdFromRoute = params?.id
 
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null)
-  const [savedStories, setSavedStories] = useState<Story[]>([])
+  const [savedStories, setSavedStories] = useState<SavedStory[]>([])
+  const [multiplayerStories, setMultiplayerStories] = useState<SavedStory[]>([])
   const [personalityResult, setPersonalityResult] = useState<PersonalityResult | null>(null)
   const [stats, setStats] = useState<UserStats>(getDefaultUserStats())
   const [isLoading, setIsLoading] = useState(true)
@@ -72,7 +81,15 @@ export default function DashboardPage() {
         const data: DashboardApiResponse = await res.json()
 
         setCurrentUser(data.user)
-        setSavedStories(data.stories || [])
+        const singleStories =
+          (data.singlePlayerStories as SavedStory[] | undefined) ??
+          (data.stories || []).filter((story: any) => !story.isMultiplayer)
+        const multiStories =
+          (data.multiplayerStories as SavedStory[] | undefined) ??
+          (data.stories || []).filter((story: any) => story.isMultiplayer)
+
+        setSavedStories(singleStories || [])
+        setMultiplayerStories(multiStories || [])
         setPersonalityResult(data.personality || null)
         setDashboardSnippet(data.player_context?.dashboard_snippet || null)
 
@@ -95,7 +112,7 @@ export default function DashboardPage() {
     void init()
   }, [userIdFromRoute, router])
 
-  const handleDeleteStory = async (id: string) => {
+  const handleDeleteStory = async (id: string, options?: { isMultiplayer?: boolean }) => {
     if (!currentUser) return
     if (!confirm("Are you sure you want to delete this story?")) return
 
@@ -105,8 +122,13 @@ export default function DashboardPage() {
         toast.error("Failed to delete story")
         return
       }
-      const updated = savedStories.filter((s) => (s as any)._id !== id && s.id !== id)
-      setSavedStories(updated)
+      if (options?.isMultiplayer) {
+        const updatedMulti = multiplayerStories.filter((s) => (s as any)._id !== id && s.id !== id)
+        setMultiplayerStories(updatedMulti)
+      } else {
+        const updatedSingle = savedStories.filter((s) => (s as any)._id !== id && s.id !== id)
+        setSavedStories(updatedSingle)
+      }
       toast.success("Story deleted")
     } catch (err) {
       console.error("Delete story error", err)
@@ -299,7 +321,7 @@ export default function DashboardPage() {
               {savedStories.map((story) => {
                 const genre = STORY_GENRES.find((g) => g.id === story.genre)
                 return (
-                    <NeonCard key={(story as any)._id || story.id} glowColor="violet">
+                  <NeonCard key={(story as any)._id || story.id} glowColor="violet">
                     <div className="flex items-start justify-between mb-4">
                       <div className="text-4xl">{genre?.icon}</div>
                       <motion.button
@@ -322,29 +344,75 @@ export default function DashboardPage() {
                       <span>{new Date((story as any).createdAt || story.createdAt).toLocaleDateString()}</span>
                     </div>
 
-                    {/* Show multiplayer badge if it's a multiplayer story */}
-                    {(story as any).isMultiplayer && (story as any).roomCode && (
-                      <div className="mb-3 px-2 py-1 bg-primary/10 border border-primary/30 rounded text-xs font-display uppercase tracking-wider text-primary">
-                        Multiplayer • Room: {(story as any).roomCode}
+                    <Link href={`/stories/play/${(story as any)._id || story.id}`} onClick={() => handlePlayStory(story)}>
+                      <NeonButton glowColor="cyan" className="w-full text-sm">
+                        <Play className="w-4 h-4 mr-2" />
+                        Continue
+                      </NeonButton>
+                    </Link>
+                  </NeonCard>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="mt-16">
+          <h2 className="text-3xl font-display font-bold mb-8 text-glow-violet uppercase">MULTIPLAYER STORIES</h2>
+
+          {multiplayerStories.length === 0 ? (
+            <HUDPanel>
+              <div className="text-center py-8">
+                <p className="text-foreground/60 mb-8 font-display uppercase tracking-wide">
+                  No multiplayer stories saved yet.
+                </p>
+                <Link href="/stories/multiplayer">
+                  <NeonButton glowColor="violet">Join or Host a Room</NeonButton>
+                </Link>
+              </div>
+            </HUDPanel>
+          ) : (
+            <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {multiplayerStories.map((story) => {
+                const genre = STORY_GENRES.find((g) => g.id === story.genre)
+                return (
+                  <NeonCard key={(story as any)._id || story.id} glowColor="cyan">
+                    <div className="flex items-start justify-between mb-4">
+                      <div className="text-4xl">{genre?.icon}</div>
+                      <motion.button
+                        whileHover={{ scale: 1.1, rotate: 90 }}
+                        whileTap={{ scale: 0.9 }}
+                        onClick={() =>
+                          handleDeleteStory(((story as any)._id || story.id) as string, { isMultiplayer: true })
+                        }
+                        className="text-foreground/50 hover:text-destructive transition-colors"
+                      >
+                        <Trash2 className="w-5 h-5" />
+                      </motion.button>
+                    </div>
+
+                    <h3 className="text-lg font-display font-bold mb-2 line-clamp-2 uppercase">{story.title}</h3>
+                    <p className="text-sm text-foreground/60 mb-4 font-display uppercase tracking-wide">
+                      {genre?.name}
+                    </p>
+
+                    <div className="flex items-center justify-between text-xs text-foreground/50 mb-3 font-display uppercase">
+                      <span>Chapter {story.currentChoiceIndex + 1}</span>
+                      <span>{new Date((story as any).createdAt || story.createdAt).toLocaleDateString()}</span>
+                    </div>
+
+                    {(story as any).roomCode && (
+                      <div className="mb-4 px-2 py-1 bg-primary/10 border border-primary/30 rounded text-xs font-display uppercase tracking-wider text-primary">
+                        Room: {(story as any).roomCode}
                       </div>
                     )}
 
-                    {/* Show Join Room button for multiplayer stories, Continue for single player */}
-                    {(story as any).isMultiplayer && (story as any).roomCode ? (
-                      <Link href={`/stories/multiplayer/room/${(story as any).roomCode}`}>
-                        <NeonButton glowColor="cyan" className="w-full text-sm">
-                          <DoorOpen className="w-4 h-4 mr-2" />
-                          Join Room
-                        </NeonButton>
-                      </Link>
-                    ) : (
-                      <Link href={`/stories/play/${(story as any)._id || story.id}`} onClick={() => handlePlayStory(story)}>
-                        <NeonButton glowColor="cyan" className="w-full text-sm">
-                          <Play className="w-4 h-4 mr-2" />
-                          Continue
-                        </NeonButton>
-                      </Link>
-                    )}
+                    <Link href={`/stories/multiplayer/room/${(story as any).roomCode}`}>
+                      <NeonButton glowColor="cyan" className="w-full text-sm">
+                        <DoorOpen className="w-4 h-4 mr-2" />
+                        Rejoin Game
+                      </NeonButton>
+                    </Link>
                   </NeonCard>
                 )
               })}

@@ -52,16 +52,52 @@ export async function POST(
       return NextResponse.json({ error: "No votes recorded" }, { status: 400 })
     }
 
+    // Check if we're in tie-breaker mode (re-voting on tied choices)
+    const isTieBreakerMode = room.tiedChoicesForVoting && room.tiedChoicesForVoting.length > 0
+
+    // Check if all participants have voted
+    // IMPORTANT: Include host in total count if host is active and not in participants array
+    // This matches the frontend logic for calculating totalPlayers
+    const hostIdString = room.hostId.toString()
+    const hostInParticipants = room.participants.some((p: any) => {
+      const pId = typeof p === "object" && p._id ? p._id.toString() : p.toString()
+      return pId === hostIdString
+    })
+    // Total players = participants + host (if host is active and not already in participants)
+    const totalParticipants = room.participants.length + (room.hostActive !== false && !hostInParticipants ? 1 : 0)
+    const uniqueVoters = new Set<string>()
+    
+    // If in tie-breaker mode, only count votes for tied choices
+    const choicesToCount = isTieBreakerMode ? room.tiedChoicesForVoting : Array.from(room.choiceVotes.keys())
+    
+    choicesToCount.forEach((choiceId: string) => {
+      const userIds = room.choiceVotes.get(choiceId) || []
+      userIds.forEach((id: any) => uniqueVoters.add(id.toString()))
+    })
+
+    // Only allow processing if all participants have voted (unless host is manually breaking a tie)
+    if (!selectedChoiceId && uniqueVoters.size < totalParticipants) {
+      return NextResponse.json({
+        error: "All participants must vote before processing",
+        participants: totalParticipants,
+        voters: uniqueVoters.size,
+        isTieBreakerMode,
+      }, { status: 400 })
+    }
+
     let maxVotes = 0
     let winningChoiceId: string | null = null
     const choiceVoteCounts: Array<{ choiceId: string; votes: number }> = []
 
-    room.choiceVotes.forEach((userIds: any[], choiceId: string) => {
+    choicesToCount.forEach((choiceId: string) => {
+      const userIds = room.choiceVotes.get(choiceId) || []
       const voteCount = userIds.length
-      choiceVoteCounts.push({ choiceId, votes: voteCount })
-      if (voteCount > maxVotes) {
-        maxVotes = voteCount
-        winningChoiceId = choiceId
+      if (voteCount > 0) {
+        choiceVoteCounts.push({ choiceId, votes: voteCount })
+        if (voteCount > maxVotes) {
+          maxVotes = voteCount
+          winningChoiceId = choiceId
+        }
       }
     })
 
@@ -69,19 +105,47 @@ export async function POST(
     const tiedChoices = choiceVoteCounts.filter((c) => c.votes === maxVotes && c.votes > 0)
     const tiedChoiceIds = tiedChoices.map((c) => c.choiceId)
 
-    // If there's a tie and no selectedChoiceId provided, return tie information
-    if (tiedChoices.length > 1 && !selectedChoiceId) {
+    // If there's a tie and we're NOT in tie-breaker mode, initiate tie-breaker voting
+    if (tiedChoices.length > 1 && !isTieBreakerMode && !selectedChoiceId) {
+      // Set tied choices for re-voting and clear votes for non-tied choices
+      room.tiedChoicesForVoting = tiedChoiceIds
+      // Clear votes for choices that are not tied
+      const allChoiceIds = Array.from(room.choiceVotes.keys())
+      allChoiceIds.forEach((choiceId: string) => {
+        if (!tiedChoiceIds.includes(choiceId)) {
+          room.choiceVotes.delete(choiceId)
+        }
+      })
+      // Clear all votes for tied choices to start fresh voting
+      tiedChoiceIds.forEach((choiceId: string) => {
+        room.choiceVotes.delete(choiceId)
+      })
+      await room.save()
+      
       return NextResponse.json({
         hasTie: true,
         tiedChoices: tiedChoiceIds,
-        message: "Tie detected. Host must select the final choice.",
+        isTieBreakerVoting: true,
+        message: "Tie detected. All players will vote again on the tied choices.",
       })
     }
 
-    // If selectedChoiceId is provided (tie-breaker), use it
+    // If there's a tie AFTER tie-breaker voting and no selectedChoiceId, require host selection
+    if (tiedChoices.length > 1 && isTieBreakerMode && !selectedChoiceId) {
+      return NextResponse.json({
+        hasTie: true,
+        tiedChoices: tiedChoiceIds,
+        isTieBreakerVoting: true,
+        requiresHostSelection: true,
+        message: "Tie persists after re-voting. Host must select the final choice.",
+      })
+    }
+
+    // If selectedChoiceId is provided (host breaking tie), use it
     if (selectedChoiceId) {
       // Validate that the selected choice is one of the tied choices
-      if (!tiedChoiceIds.includes(selectedChoiceId)) {
+      const validChoices = isTieBreakerMode ? room.tiedChoicesForVoting : tiedChoiceIds
+      if (!validChoices.includes(selectedChoiceId)) {
         return NextResponse.json({ error: "Selected choice is not one of the tied choices" }, { status: 400 })
       }
       winningChoiceId = selectedChoiceId
@@ -153,8 +217,9 @@ export async function POST(
 
     await story.save()
 
-    // Clear choice votes and update room
+    // Clear choice votes, tied choices, and update room
     room.choiceVotes = new Map()
+    room.tiedChoicesForVoting = []
     room.currentChoiceIndex = story.currentChoiceIndex
     room.isProcessing = false // Processing complete
     // Store last choice evaluation for all participants to see

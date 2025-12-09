@@ -20,41 +20,18 @@ export async function POST(request: NextRequest) {
     await connectDB()
 
     // Check if this is a multiplayer story
-    const isMultiplayer = story.isMultiplayer || story.roomCode
+    // If roomCode exists, it's always multiplayer (even if isMultiplayer flag is missing)
+    const isMultiplayer = story.isMultiplayer || !!story.roomCode
     let roomCode: string | null = story.roomCode || null
-    let allUsers: string[] = [userId] // Default to just the current user
 
-    // If multiplayer, get room and all participants
-    if (isMultiplayer) {
-      // Try to find room by roomCode if provided
-      if (roomCode) {
-        const room = await Room.findOne({ roomCode: roomCode.toUpperCase() })
+    // If multiplayer, get roomCode if not provided
+    if (isMultiplayer && !roomCode) {
+      // Try to find room by storyId
+      const storyId = story.id || story._id
+      if (storyId) {
+        const room = await Room.findOne({ storyId })
         if (room) {
-          // Include host and all participants
-          allUsers = [
-            room.hostId.toString(),
-            ...room.participants.map((p: any) => p.toString()),
-          ]
-          // Remove duplicates
-          allUsers = [...new Set(allUsers)]
-          // Ensure roomCode is set
-          if (!roomCode) {
-            roomCode = room.roomCode
-          }
-        }
-      } else {
-        // Try to find room by storyId
-        const storyId = story.id || story._id
-        if (storyId) {
-          const room = await Room.findOne({ storyId })
-          if (room) {
-            allUsers = [
-              room.hostId.toString(),
-              ...room.participants.map((p: any) => p.toString()),
-            ]
-            allUsers = [...new Set(allUsers)]
-            roomCode = room.roomCode
-          }
+          roomCode = room.roomCode
         }
       }
     }
@@ -76,59 +53,52 @@ export async function POST(request: NextRequest) {
 
     const storyId: string | undefined = story.id || story._id
 
-    // If multiplayer, save for all users
-    if (isMultiplayer && allUsers.length > 0) {
-      const savedStories = await Promise.all(
-        allUsers.map(async (targetUserId: string) => {
-          try {
-            const userPayload = { ...basePayload, userId: targetUserId }
-            
-            // Try to find existing story for this user with same roomCode
-            if (roomCode) {
-              const existing = await Story.findOne({
-                userId: targetUserId,
-                roomCode: roomCode,
-                isMultiplayer: true,
-              })
-              
-              if (existing) {
-                return await Story.findOneAndUpdate(
-                  { _id: existing._id, userId: targetUserId },
-                  userPayload,
-                  { new: true }
-                )
-              }
-            }
-            
-            // Create new story for this user
-            return await Story.create(userPayload)
-          } catch (error) {
-            console.error(`Error saving story for user ${targetUserId}:`, error)
-            return null
-          }
+    // If multiplayer, save only for the current user (not all users)
+    // This allows each user to save their own copy and rejoin later
+    if (isMultiplayer) {
+      const userPayload = { ...basePayload, userId, isMultiplayer: true } // Ensure isMultiplayer is always true
+      
+      // Try to find existing story for this user with same roomCode
+      let doc
+      if (roomCode) {
+        // Find by roomCode (more reliable than isMultiplayer flag alone)
+        const existing = await Story.findOne({
+          userId: userId,
+          roomCode: roomCode,
         })
-      )
-
-      // Return the story saved for the current user
-      const currentUserStory = savedStories.find(
-        (s) => s && s.userId.toString() === userId
-      ) || savedStories[0]
+        
+        if (existing) {
+          // Update existing story, ensuring isMultiplayer is set to true
+          doc = await Story.findOneAndUpdate(
+            { _id: existing._id, userId: userId },
+            userPayload,
+            { new: true }
+          )
+        } else {
+          doc = await Story.create(userPayload)
+        }
+      } else {
+        // If no roomCode, create new story
+        doc = await Story.create(userPayload)
+      }
 
       return NextResponse.json(
         {
-          message: "Story saved for all participants",
-          story: currentUserStory,
+          message: "Story saved to your multiplayer library",
+          story: doc,
         },
         { status: 200 },
       )
     }
 
     // Single player story - save normally
+    // Ensure isMultiplayer is explicitly false for single player stories
+    const singlePlayerPayload = { ...basePayload, isMultiplayer: false, roomCode: null, userId }
     let doc
     if (storyId) {
       doc = await Story.findOneAndUpdate(
-        { _id: storyId, userId },
-        { ...basePayload, userId },
+        { _id: storyId, userId, isMultiplayer: { $ne: true } }, // Only update if not multiplayer
+        singlePlayerPayload,
         {
           new: true,
         }
@@ -136,10 +106,10 @@ export async function POST(request: NextRequest) {
 
       if (!doc) {
         // If not found for this user/id, create a fresh one
-        doc = await Story.create({ ...basePayload, userId })
+        doc = await Story.create(singlePlayerPayload)
       }
     } else {
-      doc = await Story.create({ ...basePayload, userId })
+      doc = await Story.create(singlePlayerPayload)
     }
 
     return NextResponse.json(

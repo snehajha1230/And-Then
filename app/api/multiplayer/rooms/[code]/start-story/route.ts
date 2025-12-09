@@ -15,6 +15,11 @@ export async function POST(
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     }
 
+    const body = await request
+      .json()
+      .catch(() => ({})) as { selectedGenre?: string | null }
+    const selectedGenreFromHost = body?.selectedGenre
+
     const { code } = await params
     const roomCode = code.toUpperCase()
 
@@ -40,6 +45,23 @@ export async function POST(
       return NextResponse.json({ error: "No genre votes recorded" }, { status: 400 })
     }
 
+    // Ensure everyone has voted before starting
+    const uniqueVoters = new Set<string>()
+    room.genreVotes.forEach((userIds: any[]) => {
+      userIds.forEach((id: any) => uniqueVoters.add(id.toString()))
+    })
+    const totalParticipants = room.participants.length
+    if (uniqueVoters.size < totalParticipants) {
+      return NextResponse.json(
+        {
+          error: "All participants must vote before starting the story",
+          participants: totalParticipants,
+          voters: uniqueVoters.size,
+        },
+        { status: 400 },
+      )
+    }
+
     let maxVotes = 0
     let selectedGenre: string | null = null
     const genreVoteCounts: Array<{ genreId: string; votes: number }> = []
@@ -53,15 +75,30 @@ export async function POST(
       }
     })
 
-    // Check for ties - if there's a tie, use host's vote as tiebreaker
+    // Check for ties - host must choose when there's a tie
     const tiedGenres = genreVoteCounts.filter((g) => g.votes === maxVotes)
     if (tiedGenres.length > 1) {
-      // Find host's vote
-      const hostVote = Array.from(room.genreVotes.entries()).find(([genreId, userIds]) => {
-        return userIds.some((id: any) => id.toString() === room.hostId.toString())
-      })
-      if (hostVote) {
-        selectedGenre = hostVote[0]
+      // If host provided a choice, validate it; otherwise surface tie info
+      if (selectedGenreFromHost) {
+        const isValidChoice = tiedGenres.some((g) => g.genreId === selectedGenreFromHost)
+        if (!isValidChoice) {
+          return NextResponse.json(
+            {
+              error: "Selected genre is not part of the tie",
+              tiedGenres,
+            },
+            { status: 400 },
+          )
+        }
+        selectedGenre = selectedGenreFromHost
+      } else {
+        return NextResponse.json(
+          {
+            error: "Tie detected. Host must select a genre to proceed.",
+            tiedGenres,
+          },
+          { status: 400 },
+        )
       }
     }
 
